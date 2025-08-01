@@ -1,0 +1,47 @@
+Designing Applications and Architecture in AWS
+Course-end Project
+
+				Real-time Data Management
+
+
+			Objectives
+ To deploying infrastructure for real-time data management 
+requirements on the AWS Cloud offers a scalable, flexible, 
+and cost-effective solution for organizations aiming to 
+harness the power of real-time data processing. 
+
+			Motivation
+ Problem Statement: 
+You are given a project to create data in a Kinesis stream that can be 
+copied to the DynamoDB database
+ Real-World Scenario:
+ TELEMAX is a company that plans to build networks in rapidly growing, 
+underserved markets around the world. The company offers 
+innovative communications hardware that enables them to create 
+many speed-efficient networking links with inexpensive hardware.
+ Presently, they need, to deploy an effective architecture for NoSQL
+based data warehousing built from real-time data being generated that 
+can be analyzed in the future to optimize their topologies continuously. 
+The team decided the AWS cloud is the perfect environment to support 
+their solution needs and they will approach your organization for 
+consultation on the same.
+
+			
+			Industry Relevance
+ Skills used in the project and their usage in the industry are given below:
+ 1. AWS console –The AWS Management Console is a web application that 
+includes and references several service consoles for managing AWS services.
+ 2. Kinesis DataStream - Amazon Kinesis Data Streams is a serverless 
+streaming data solution that enables capturing, processing, and storing data 
+streams at any scale.
+ 3. Lambda Function - AWS Lambda is a serverless compute service that 
+executes user code in response to events and manages the underlying 
+compute resources automatically.
+
+Task (Activities)
+ 1. Create an AWS Kinesis Data Streams 
+2. Create an AWS Lambda Function 
+3. Create an AWS DynamoDB Database 
+4. Perform Scan Operation
+
+
