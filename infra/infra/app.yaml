@@ -107,3 +107,175 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppRuntimeMinimal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ logs:PutLogEvents, logs:CreateLogStream, logs:CreateLogGroup ]
+                Resource: '*'
+
+  # ALB in public subnets
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvName}-wp-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PublicSubnets" } ]
+      SecurityGroups: [ { "Fn::ImportValue": !Sub "${EnvName}-AlbSG" } ]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvName}-wp-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 80
+      VpcId: { "Fn::ImportValue": !Sub "${EnvName}-VpcId" }
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200-399'
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # Task Definition with EFS volume
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvName}-wp-task'
+      RequiresCompatibilities: [ FARGATE ]
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref EcsExecutionRole
+      TaskRoleArn: !Ref EcsTaskRole
+      Volumes:
+        - Name: wpcontent
+          EFSVolumeConfiguration:
+            FilesystemId: { "Fn::ImportValue": !Sub "${EnvName}-EfsId" }
+            TransitEncryption: ENABLED
+      ContainerDefinitions:
+        - Name: wordpress
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - { RepoUri: !GetAtt EcrRepo.RepositoryUri }
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: wp
+          Environment:
+            - Name: WORDPRESS_DB_NAME
+              Value: !Ref DBNameParam
+            - Name: WP_DEBUG
+              Value: !If [ IsDev, 'true', 'false' ]
+            - Name: WORDPRESS_DB_HOST
+              Value: !Ref DbEndpointParam
+          Secrets:
+            - Name: WORDPRESS_DB_USER
+              ValueFrom: !Sub '{{resolve:secretsmanager:${DbSecretArnParam}:SecretString:username}}'
+            - Name: WORDPRESS_DB_PASSWORD
+              ValueFrom: !Sub '{{resolve:secretsmanager:${DbSecretArnParam}:SecretString:password}}'
+            - !If
+              - HasSaltsSecret
+              - { Name: AUTH_KEY,            ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:AUTH_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: SECURE_AUTH_KEY,     ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:SECURE_AUTH_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: LOGGED_IN_KEY,       ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:LOGGED_IN_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: NONCE_KEY,           ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:NONCE_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: AUTH_SALT,           ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:AUTH_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: SECURE_AUTH_SALT,    ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:SECURE_AUTH_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: LOGGED_IN_SALT,      ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:LOGGED_IN_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: NONCE_SALT,          ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:NONCE_SALT}}' }
+              - !Ref 'AWS::NoValue'
+          MountPoints:
+            - SourceVolume: wpcontent
+              ContainerPath: /var/www/html/wp-content
+          Essential: true
+
+  # ECS Service
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub '${EnvName}-wp-service'
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [ IsDev, ENABLED, DISABLED ]
+          Subnets: !If
+            - IsDev
+            - !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PublicSubnets" } ]
+            - !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PrivateSubnets" } ]
+          SecurityGroups:
+            - { "Fn::ImportValue": !Sub "${EnvName}-EcsSG" }
+      LoadBalancers:
+        - ContainerName: wordpress
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      SchedulingStrategy: REPLICA
+      PlatformVersion: '1.4.0'
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub '${EnvName}-ClusterName'
+
+  ServiceName:
+    Value: !Ref Service
+    Export:
+      Name: !Sub '${EnvName}-ServiceName'
+
+  AlbDNSName:
+    Value: !GetAtt ALB.DNSName
+
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+
+  LogGroupName:
+    Value: !Ref AppLogGroup
