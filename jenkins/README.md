@@ -1,1 +1,1 @@
-Placeholder for Jenkinsfile and pipeline docs
+This folder contains the Jenkinsfile and pipeline notes.

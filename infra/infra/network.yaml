@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Base networking for WordPress (VPC, Subnets, IGW, NAT, EFS, Security Groups)
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: Environment name (e.g., prod or dev)
+    AllowedPattern: '^[a-z0-9-]+$'
+    Default: dev
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for the VPC
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Environment" }
+        Parameters: [ EnvName, VpcCidr ]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-igw' }]
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Derive 4 /20 subnets from the VPC using Fn::Cidr (2 public + 2 private)
+  SubnetCidrs:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/cloudformation-examples/template-snippets/cidr-functions.json
+  # Note: The above is not required for Fn::Cidr; we'll compute inline below.
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 0, !Cidr [ !Ref VpcCidr, 4, 12 ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${EnvName}-public-a' }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 1, !Cidr [ !Ref VpcCidr, 4, 12 ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${EnvName}-public-b' }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 2, !Cidr [ !Ref VpcCidr, 4, 12 ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${EnvName}-private-a' }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 3, !Cidr [ !Ref VpcCidr, 4, 12 ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${EnvName}-private-b' }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-public-rt' }]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway (in PublicSubnetA)
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-nat' }]
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-private-a-rt' }]
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-private-b-rt' }]
+
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # Security Groups
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress from Internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        # Add 443 in app stack if using HTTPS
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-alb-sg' }]
+
+  EcsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSG
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-ecs-sg' }]
+
+  RdsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EcsSG
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-rds-sg' }]
+
+  EfsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS NFS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EcsSG
+      Tags: [{ Key: Name, Value: !Sub '${EnvName}-efs-sg' }]
+
+  # EFS with mount targets in private subnets
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      BackupPolicy:
+        Status: DISABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${EnvName}-wp-efs'
+
+  EfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [ !Ref EfsSG ]
+
+  EfsMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups: [ !Ref EfsSG ]
+
+Outputs:
+  VpcId:
+    Description: VPC Id
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${EnvName}-VpcId'
+
+  PublicSubnets:
+    Description: Comma-separated public subnet IDs
+    Value: !Join [ ",", [ !Ref PublicSubnetA, !Ref PublicSubnetB ] ]
+    Export:
+      Name: !Sub '${EnvName}-PublicSubnets'
+
+  PrivateSubnets:
+    Description: Comma-separated private subnet IDs
+    Value: !Join [ ",", [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ] ]
+    Export:
+      Name: !Sub '${EnvName}-PrivateSubnets'
+
+  AlbSGId:
+    Description: ALB Security Group
+    Value: !Ref AlbSG
+    Export:
+      Name: !Sub '${EnvName}-AlbSG'
+
+  EcsSGId:
+    Description: ECS Security Group
+    Value: !Ref EcsSG
+    Export:
+      Name: !Sub '${EnvName}-EcsSG'
+
+  RdsSGId:
+    Description: RDS Security Group
+    Value: !Ref RdsSG
+    Export:
+      Name: !Sub '${EnvName}-RdsSG'
+
+  EfsId:
+    Description: EFS FileSystem ID
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub '${EnvName}-EfsId'
