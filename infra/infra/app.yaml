@@ -1,1 +1,109 @@
-placeholder – ECS, ALB, ECR, and service template will be added here.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WordPress App Stack (ECR, ECS Fargate, ALB, Logs) - Dev uses public subnets, Prod uses private
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Environment name (e.g., dev or prod)
+    Default: dev
+
+  ImageTag:
+    Type: String
+    Description: Docker image tag to deploy (e.g., latest or a commit SHA)
+    Default: latest
+
+  DesiredCount:
+    Type: Number
+    Description: Number of tasks to run (prod >= 2, dev 1)
+    Default: 1
+    MinValue: 0
+
+  DBNameParam:
+    Type: String
+    Default: wordpress
+    Description: WordPress DB name
+
+  DbSecretArnParam:
+    Type: String
+    Description: Secrets Manager ARN that contains username/password keys
+
+  DbEndpointParam:
+    Type: String
+    Description: RDS endpoint hostname (e.g., db-xxx.us-east-1.rds.amazonaws.com)
+
+  # Optional: a secret containing WP salts/keys with keys AUTH_KEY, etc.
+  WpSaltsSecretArnParam:
+    Type: String
+    Default: ''
+    Description: Optional Secrets Manager ARN with WP salts/keys (leave empty to skip)
+
+Conditions:
+  IsDev: !Equals [ !Ref EnvName, 'dev' ]
+  HasSaltsSecret: !Not [ !Equals [ !Ref WpSaltsSecretArnParam, '' ] ]
+
+Resources:
+  # ECR repository for the WordPress image
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${EnvName}-wordpress'
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              { "rulePriority": 1, "description": "Keep last 10 images", "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10 }, "action": { "type": "expire" } }
+            ]
+          }
+
+  # CloudWatch Logs group
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvName}-wp'
+      RetentionInDays: 14
+
+  # ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvName}-wp-cluster'
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  # IAM roles
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsPullECR
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbSecretArnParam
+                  - !If [ HasSaltsSecret, !Ref WpSaltsSecretArnParam, !Ref 'AWS::NoValue' ]
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
