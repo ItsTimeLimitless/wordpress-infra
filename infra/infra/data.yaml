@@ -1,1 +1,77 @@
-placeholder – RDS and Secrets template will be added here.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Data layer for WordPress (RDS MySQL + Secrets) with auto minor version upgrades
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: Environment name (e.g., prod or dev)
+    AllowedPattern: '^[a-z0-9-]+$'
+    Default: dev
+  DBName:
+    Type: String
+    Default: wordpress
+    Description: Database name
+  AllocatedStorageGiB:
+    Type: Number
+    Default: 20
+    Description: Storage size in GiB (dev small; prod can be larger)
+
+Conditions:
+  IsProd: !Equals [!Ref EnvName, 'prod']
+
+Resources:
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'WordPress DB credentials for ${EnvName}'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"wpuser"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${EnvName}-PrivateSubnets" } ]
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub 'MySQL parameter group for ${EnvName}'
+      Family: mysql8.0
+
+  MyDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      EngineVersion: '8.0'
+      AutoMinorVersionUpgrade: true
+      DBName: !Ref DBName
+      DBInstanceClass: !If [ IsProd, db.t4g.large, db.t4g.micro ]
+      AllocatedStorage: !Ref AllocatedStorageGiB
+      StorageType: gp3
+      MultiAZ: !If [ IsProd, true, false ]
+      PubliclyAccessible: false
+      VPCSecurityGroups: [ { "Fn::ImportValue": !Sub "${EnvName}-RdsSG" } ]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBParameterGroupName: !Ref DBParameterGroup
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      BackupRetentionPeriod: !If [ IsProd, 7, 1 ]
+      DeletionProtection: !If [ IsProd, true, false ]
+      EnableIAMDatabaseAuthentication: false
+      CopyTagsToSnapshot: true
+
+Outputs:
+  DbEndpointAddress:
+    Description: RDS endpoint address
+    Value: !GetAtt MyDB.Endpoint.Address
+    Export:
+      Name: !Sub '${EnvName}-DbEndpoint'
+  DbSecretArn:
+    Description: Secret ARN for DB creds
+    Value: !Ref DbSecret
+    Export:
+      Name: !Sub '${EnvName}-DbSecretArn'
