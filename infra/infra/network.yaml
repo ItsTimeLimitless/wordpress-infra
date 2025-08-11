@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Base networking for WordPress (VPC, Subnets, IGW, NAT, EFS, Security Groups)
+Description: Base networking for WordPress (VPC, Subnets, IGW, EFS, Security Groups) - No NAT Gateway for cost savings
 
 Parameters:
   EnvName:
@@ -39,13 +39,6 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
-
-  # Derive 4 /20 subnets from the VPC using Fn::Cidr (2 public + 2 private)
-  SubnetCidrs:
-    Type: AWS::CloudFormation::Stack
-    Properties:
-      TemplateURL: https://s3.amazonaws.com/cloudformation-examples/template-snippets/cidr-functions.json
-  # Note: The above is not required for Fn::Cidr; we'll compute inline below.
 
   PublicSubnetA:
     Type: AWS::EC2::Subnet
@@ -112,19 +105,8 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  # NAT Gateway (in PublicSubnetA)
-  NatEip:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-
-  NatGateway:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt NatEip.AllocationId
-      SubnetId: !Ref PublicSubnetA
-      Tags: [{ Key: Name, Value: !Sub '${EnvName}-nat' }]
-
+  # Private subnets will not have a default route to the internet without NAT Gateway
+  # They will only have local routes within the VPC. This is fine for RDS.
   PrivateRouteTableA:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -136,20 +118,6 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       Tags: [{ Key: Name, Value: !Sub '${EnvName}-private-b-rt' }]
-
-  PrivateRouteA:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref PrivateRouteTableA
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGateway
-
-  PrivateRouteB:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref PrivateRouteTableB
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGateway
 
   PrivateSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
