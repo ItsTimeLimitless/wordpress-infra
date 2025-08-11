@@ -43,7 +43,6 @@ Conditions:
   HasSaltsSecret: !Not [ !Equals [ !Ref WpSaltsSecretArnParam, '' ] ]
 
 Resources:
-  # ECR repository for the WordPress image
   EcrRepo:
     Type: AWS::ECR::Repository
     Properties:
@@ -59,14 +58,12 @@ Resources:
             ]
           }
 
-  # CloudWatch Logs group
   AppLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/ecs/${EnvName}-wp'
       RetentionInDays: 14
 
-  # ECS Cluster
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -75,7 +72,6 @@ Resources:
         ExecuteCommandConfiguration:
           Logging: DEFAULT
 
-  # IAM roles
   EcsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -119,7 +115,6 @@ Resources:
                 Action: [ logs:PutLogEvents, logs:CreateLogStream, logs:CreateLogGroup ]
                 Resource: '*'
 
-  # ALB in public subnets
   ALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -152,7 +147,6 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
-  # Task Definition with EFS volume
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -231,7 +225,6 @@ Resources:
               ContainerPath: /var/www/html/wp-content
           Essential: true
 
-  # ECS Service
   Service:
     Type: AWS::ECS::Service
     DependsOn: HttpListener
@@ -258,7 +251,7 @@ Resources:
           ContainerPort: 80
           TargetGroupArn: !Ref TargetGroup
       SchedulingStrategy: REPLICA
-      PlatformVersion: '1.4.0'
+      PlatformVersion: LATEST
 
 Outputs:
   ClusterName:
