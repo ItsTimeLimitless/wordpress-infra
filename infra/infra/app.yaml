@@ -1,1 +1,274 @@
-placeholder – ECS, ALB, ECR, and service template will be added here.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WordPress App Stack (ECR, ECS Fargate, ALB, Logs) - Dev uses public subnets, Prod uses private
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Environment name (e.g., dev or prod)
+    Default: dev
+
+  ImageTag:
+    Type: String
+    Description: Docker image tag to deploy (e.g., latest or a commit SHA)
+    Default: latest
+
+  DesiredCount:
+    Type: Number
+    Description: Number of tasks to run (prod >= 2, dev 1)
+    Default: 1
+    MinValue: 0
+
+  DBNameParam:
+    Type: String
+    Default: wordpress
+    Description: WordPress DB name
+
+  DbSecretArnParam:
+    Type: String
+    Description: Secrets Manager ARN that contains username/password keys
+
+  DbEndpointParam:
+    Type: String
+    Description: RDS endpoint hostname (e.g., db-xxx.us-east-1.rds.amazonaws.com)
+
+  # Optional: a secret containing WP salts/keys with keys AUTH_KEY, etc.
+  WpSaltsSecretArnParam:
+    Type: String
+    Default: ''
+    Description: Optional Secrets Manager ARN with WP salts/keys (leave empty to skip)
+
+Conditions:
+  IsDev: !Equals [ !Ref EnvName, 'dev' ]
+  HasSaltsSecret: !Not [ !Equals [ !Ref WpSaltsSecretArnParam, '' ] ]
+
+Resources:
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${EnvName}-wordpress'
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              { "rulePriority": 1, "description": "Keep last 10 images", "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10 }, "action": { "type": "expire" } }
+            ]
+          }
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvName}-wp'
+      RetentionInDays: 14
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvName}-wp-cluster'
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsPullECR
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbSecretArnParam
+                  - !If [ HasSaltsSecret, !Ref WpSaltsSecretArnParam, !Ref 'AWS::NoValue' ]
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppRuntimeMinimal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ logs:PutLogEvents, logs:CreateLogStream, logs:CreateLogGroup ]
+                Resource: '*'
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvName}-wp-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PublicSubnets" } ]
+      SecurityGroups: [ { "Fn::ImportValue": !Sub "${EnvName}-AlbSG" } ]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvName}-wp-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 80
+      VpcId: { "Fn::ImportValue": !Sub "${EnvName}-VpcId" }
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200-399'
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvName}-wp-task'
+      RequiresCompatibilities: [ FARGATE ]
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref EcsExecutionRole
+      TaskRoleArn: !Ref EcsTaskRole
+      Volumes:
+        - Name: wpcontent
+          EFSVolumeConfiguration:
+            FilesystemId: { "Fn::ImportValue": !Sub "${EnvName}-EfsId" }
+            TransitEncryption: ENABLED
+      ContainerDefinitions:
+        - Name: wordpress
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - { RepoUri: !GetAtt EcrRepo.RepositoryUri }
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: wp
+          Environment:
+            - Name: WORDPRESS_DB_NAME
+              Value: !Ref DBNameParam
+            - Name: WP_DEBUG
+              Value: !If [ IsDev, 'true', 'false' ]
+            - Name: WORDPRESS_DB_HOST
+              Value: !Ref DbEndpointParam
+          Secrets:
+            - Name: WORDPRESS_DB_USER
+              ValueFrom: !Sub '{{resolve:secretsmanager:${DbSecretArnParam}:SecretString:username}}'
+            - Name: WORDPRESS_DB_PASSWORD
+              ValueFrom: !Sub '{{resolve:secretsmanager:${DbSecretArnParam}:SecretString:password}}'
+            - !If
+              - HasSaltsSecret
+              - { Name: AUTH_KEY,            ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:AUTH_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: SECURE_AUTH_KEY,     ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:SECURE_AUTH_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: LOGGED_IN_KEY,       ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:LOGGED_IN_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: NONCE_KEY,           ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:NONCE_KEY}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: AUTH_SALT,           ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:AUTH_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: SECURE_AUTH_SALT,    ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:SECURE_AUTH_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: LOGGED_IN_SALT,      ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:LOGGED_IN_SALT}}' }
+              - !Ref 'AWS::NoValue'
+            - !If
+              - HasSaltsSecret
+              - { Name: NONCE_SALT,          ValueFrom: !Sub '{{resolve:secretsmanager:${WpSaltsSecretArnParam}:SecretString:NONCE_SALT}}' }
+              - !Ref 'AWS::NoValue'
+          MountPoints:
+            - SourceVolume: wpcontent
+              ContainerPath: /var/www/html/wp-content
+          Essential: true
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub '${EnvName}-wp-service'
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !If [ IsDev, ENABLED, DISABLED ]
+          Subnets: !If
+            - IsDev
+            - !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PublicSubnets" } ]
+            - !Split [ ",", { "Fn::ImportValue": !Sub "${EnvName}-PrivateSubnets" } ]
+          SecurityGroups:
+            - { "Fn::ImportValue": !Sub "${EnvName}-EcsSG" }
+      LoadBalancers:
+        - ContainerName: wordpress
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      SchedulingStrategy: REPLICA
+      PlatformVersion: LATEST
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub '${EnvName}-ClusterName'
+
+  ServiceName:
+    Value: !Ref Service
+    Export:
+      Name: !Sub '${EnvName}-ServiceName'
+
+  AlbDNSName:
+    Value: !GetAtt ALB.DNSName
+
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+
+  LogGroupName:
+    Value: !Ref AppLogGroup
